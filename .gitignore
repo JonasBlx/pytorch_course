@@ -1,3 +1,14 @@
+
+# Ignore everything in the dataset folder
+dataset/
+
+# Ignore directories ending with 'env'
+*env/
+
+# Ignore directories starting with 'venv' or 'env'
+venv*/
+env*/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
