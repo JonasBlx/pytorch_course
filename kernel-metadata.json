@@ -1,0 +1,11 @@
+{
+    "id": "jonasbalandraux/seq2seq-model",
+    "title": "Seq2Seq Model",
+    "code_file": "seq2seq_model.py",
+    "language": "python",
+    "kernel_type": "script",
+    "is_private": "true",
+    "enable_gpu": "true",
+    "enable_internet": "true"
+  }
+  
