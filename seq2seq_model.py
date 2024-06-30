@@ -68,12 +68,18 @@ class Encoder(nn.Module):
         self.num_layers = num_layers
         self.dropout = nn.Dropout(p)
         self.embedding = nn.Embedding(input_size, embedding_size)
-        self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, dropout=p)
+        self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, bidirectional=True)
+        self.fc_hidden = nn.Linear(hidden_size * 2, hidden_size)
+        self.fc_cell = nn.Linear(hidden_size * 2, hidden_size)
 
     def forward(self, x):
         embedding = self.dropout(self.embedding(x))
-        outputs, (hidden, cell) = self.rnn(embedding)
-        return hidden, cell
+        encoder_states, (hidden, cell) = self.rnn(embedding)
+        hidden = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
+        hidden = self.fc_hidden(hidden).unsqueeze(0)
+        cell = torch.cat((cell[-2,:,:], cell[-1,:,:]), dim=1)
+        cell = self.fc_cell(cell).unsqueeze(0)
+        return encoder_states, hidden, cell
 
 class Decoder(nn.Module):
     def __init__(self, input_size, embedding_size, hidden_size, output_size, num_layers, p):
@@ -82,13 +88,24 @@ class Decoder(nn.Module):
         self.num_layers = num_layers
         self.dropout = nn.Dropout(p)
         self.embedding = nn.Embedding(input_size, embedding_size)
-        self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, dropout=p)
+        self.rnn = nn.LSTM(hidden_size*2+embedding_size, hidden_size, num_layers)
+        self.energy = nn.Linear(hidden_size*3, 1)
+        self.softmax = nn.Softmax(dim=0)
+        self.relu = nn.ReLU()
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(self, x, hidden, cell):
+    def forward(self, x, encoder_states, hidden, cell):
         x = x.unsqueeze(0)
         embedding = self.dropout(self.embedding(x))
-        outputs, (hidden, cell) = self.rnn(embedding, (hidden, cell))
+        sequence_length = encoder_states.shape[0]
+        h_reshaped = hidden.repeat(sequence_length, 1, 1)
+        energy = self.relu(self.energy(torch.cat((h_reshaped, encoder_states), dim=2)))
+        attention = self.softmax(energy)
+        attention = attention.permute(1, 2, 0)
+        encoder_states = encoder_states.permute(1, 0, 2)
+        context_vector = torch.bmm(attention, encoder_states).permute(1, 0, 2)
+        rnn_input = torch.cat((context_vector, embedding), dim=2)
+        outputs, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
         predictions = self.fc(outputs)
         predictions = predictions.squeeze(0)
         return predictions, hidden, cell
@@ -104,11 +121,11 @@ class Seq2Seq(nn.Module):
         target_len = target.shape[0]
         target_vocab_size = len(vocab_eng)
         outputs = torch.zeros(target_len, batch_size, target_vocab_size).to(device)
-        hidden, cell = self.encoder(source)
+        encoder_states, hidden, cell = self.encoder(source)
         x = target[0]
 
         for t in range(1, target_len):
-            output, hidden, cell = self.decoder(x, hidden, cell)
+            output, hidden, cell = self.decoder(x, encoder_states, hidden, cell)
             outputs[t] = output
             best_guess = output.argmax(1)
             x = target[t] if random.random() < teacher_force_ratio else best_guess
@@ -127,7 +144,7 @@ output_size = len(vocab_eng)
 encoder_embedding_size = 300
 decoder_embedding_size = 300
 hidden_size = 1024
-num_layers = 2
+num_layers = 1
 enc_dropout = 0.5
 dec_dropout = 0.5
 
@@ -175,13 +192,13 @@ def translate_sentence(model, sentence, tokenizer_ger, vocab_ger, vocab_eng, dev
     print(f'Tokens convertis en indices: {text_to_indices}')
     sentence_tensor = torch.LongTensor(text_to_indices).unsqueeze(1).to(device)
     with torch.no_grad():
-        hidden, cell = model.encoder(sentence_tensor)
+        encoder_states, hidden, cell = model.encoder(sentence_tensor)
     outputs = [vocab_eng['<sos>']]
 
     for _ in range(max_length):
         previous_word = torch.LongTensor([outputs[-1]]).to(device)
         with torch.no_grad():
-            output, hidden, cell = model.decoder(previous_word, hidden, cell)
+            output, hidden, cell = model.decoder(previous_word, encoder_states, hidden, cell)
         best_guess = output.argmax(1).item()
         outputs.append(best_guess)
         if output.argmax(1).item() == vocab_eng['<eos>']:
