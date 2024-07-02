@@ -2,11 +2,21 @@ import os
 import subprocess
 import sys
 
-# Installer portalocker si non installé
+
+# Install portalocker if not installed
 try:
     import portalocker  # noqa: F401
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "portalocker==2.10.0"])
+
+# Install nltk if not installed
+try:
+    import nltk
+    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "nltk"])
+    import nltk
+    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 import torch
 import torch.nn as nn
@@ -21,7 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
-# Vérifiez et téléchargez les modèles spaCy si nécessaire
+# Check and download spaCy models if necessary
 import spacy.cli
 try:
     spacy_ger = spacy.load("de_core_news_sm")
@@ -42,7 +52,7 @@ def tokenizer_ger(text):
 def tokenizer_eng(text):
     return [tok.text for tok in spacy_eng.tokenizer(text)]
 
-# Construction des vocabulaires
+# Building vocabularies
 def yield_tokens(data_iter, tokenizer):
     for _, (src, trg) in enumerate(data_iter):
         yield tokenizer(src)
@@ -53,62 +63,93 @@ train_data, valid_data, test_data = Multi30k(split=('train', 'valid', 'test'), l
 vocab_ger = build_vocab_from_iterator(yield_tokens(train_data, tokenizer_ger), specials=["<sos>", "<eos>", "<pad>", "<unk>"], min_freq=1)
 vocab_eng = build_vocab_from_iterator(yield_tokens(train_data, tokenizer_eng), specials=["<sos>", "<eos>", "<pad>", "<unk>"], min_freq=1)
 
-print(f'Taille du vocabulaire allemand: {len(vocab_ger)}')
-print(f'Taille du vocabulaire anglais: {len(vocab_eng)}')
+print(f'Size of German vocabulary: {len(vocab_ger)}')
+print(f'Size of English vocabulary: {len(vocab_eng)}')
 
-# Définir un index par défaut pour les tokens inconnus
+# Define a default index for unknown tokens
 vocab_ger.set_default_index(vocab_ger["<unk>"])
 vocab_eng.set_default_index(vocab_eng["<unk>"])
 
-# Définition des modèles
 class Encoder(nn.Module):
-    def __init__(self, input_size, embedding_size, hidden_size, num_layers, p):
+    def __init__(self, input_size, embedding_size=512, hidden_size=512, num_layers=3, p=0.3):
         super(Encoder, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout = nn.Dropout(p)
         self.embedding = nn.Embedding(input_size, embedding_size)
-        self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, bidirectional=True)
-        self.fc_hidden = nn.Linear(hidden_size * 2, hidden_size)
-        self.fc_cell = nn.Linear(hidden_size * 2, hidden_size)
+        self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, bidirectional=True, dropout=p if num_layers > 1 else 0)
+        
+        self.fc_hidden = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        self.fc_cell = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p),
+            nn.Linear(hidden_size, hidden_size)
+        )
 
     def forward(self, x):
         embedding = self.dropout(self.embedding(x))
         encoder_states, (hidden, cell) = self.rnn(embedding)
+        
         hidden = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
-        hidden = self.fc_hidden(hidden).unsqueeze(0)
+        hidden = self.fc_hidden(hidden)
+        hidden = hidden.unsqueeze(0).repeat(self.num_layers, 1, 1)
+        
         cell = torch.cat((cell[-2,:,:], cell[-1,:,:]), dim=1)
-        cell = self.fc_cell(cell).unsqueeze(0)
+        cell = self.fc_cell(cell)
+        cell = cell.unsqueeze(0).repeat(self.num_layers, 1, 1)
+        
         return encoder_states, hidden, cell
 
 class Decoder(nn.Module):
-    def __init__(self, input_size, embedding_size, hidden_size, output_size, num_layers, p):
+    def __init__(self, input_size, embedding_size=512, hidden_size=512, output_size=None, num_layers=3, p=0.3):
         super(Decoder, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout = nn.Dropout(p)
         self.embedding = nn.Embedding(input_size, embedding_size)
-        self.rnn = nn.LSTM(hidden_size*2+embedding_size, hidden_size, num_layers)
-        self.energy = nn.Linear(hidden_size*3, 1)
+        
+        self.rnn = nn.LSTM(hidden_size*2 + embedding_size, hidden_size, num_layers, dropout=p if num_layers > 1 else 0)
+        
+        self.energy = nn.Sequential(
+            nn.Linear(hidden_size*3, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(p),
+            nn.Linear(hidden_size, 1)
+        )
+        
         self.softmax = nn.Softmax(dim=0)
-        self.relu = nn.ReLU()
         self.fc = nn.Linear(hidden_size, output_size)
+        self.relu = nn.ReLU()
 
     def forward(self, x, encoder_states, hidden, cell):
         x = x.unsqueeze(0)
         embedding = self.dropout(self.embedding(x))
         sequence_length = encoder_states.shape[0]
-        h_reshaped = hidden.repeat(sequence_length, 1, 1)
+        
+        h_reshaped = hidden[-1].unsqueeze(0).repeat(sequence_length, 1, 1)
+        
         energy = self.relu(self.energy(torch.cat((h_reshaped, encoder_states), dim=2)))
         attention = self.softmax(energy)
+        
         attention = attention.permute(1, 2, 0)
         encoder_states = encoder_states.permute(1, 0, 2)
         context_vector = torch.bmm(attention, encoder_states).permute(1, 0, 2)
+        
         rnn_input = torch.cat((context_vector, embedding), dim=2)
         outputs, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
+        
         predictions = self.fc(outputs)
         predictions = predictions.squeeze(0)
+        
         return predictions, hidden, cell
+
 
 class Seq2Seq(nn.Module):
     def __init__(self, encoder, decoder):
@@ -132,27 +173,30 @@ class Seq2Seq(nn.Module):
         
         return outputs
 
-# Paramètres d'entraînement
-num_epochs = 30  # Augmenter le nombre d'époques
-learning_rate = 0.0005  # Ajuster le taux d'apprentissage
+# Training parameters
+learning_rate_initial = 0.002
+learning_rate_final = 0.0005
+learning_rate_decay = 0.9
+learning_rate = learning_rate_initial
 batch_size = 64
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f'Using {device}')
 
 input_size_encoder = len(vocab_ger)
 input_size_decoder = len(vocab_eng)
 output_size = len(vocab_eng)
-encoder_embedding_size = 300
-decoder_embedding_size = 300
-hidden_size = 1024
-num_layers = 1
-enc_dropout = 0.5
-dec_dropout = 0.5
+encoder_embedding_size = 512
+decoder_embedding_size = 512
+hidden_size = 512
+num_layers = 3
+enc_dropout = 0.3
+dec_dropout = 0.3
 
-# Configuration de TensorBoard
+# Configuring TensorBoard
 writer = SummaryWriter(f"runs/seq2seq_experiment")
 step = 0
 
-# Fonction de collation pour DataLoader
 def collate_fn(batch):
     src_batch, trg_batch = [], []
     for src_sample, trg_sample in batch:
@@ -164,12 +208,12 @@ def collate_fn(batch):
     trg_batch = pad_sequence(trg_batch, padding_value=vocab_eng['<pad>'])
     return src_batch, trg_batch
 
-# Création des DataLoader
+# Creating DataLoaders
 train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 valid_loader = DataLoader(valid_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
-# Instanciation des modèles
+# Model instantiation
 encoder_net = Encoder(input_size_encoder, encoder_embedding_size, hidden_size, num_layers, enc_dropout).to(device)
 decoder_net = Decoder(input_size_decoder, decoder_embedding_size, hidden_size, output_size, num_layers, dec_dropout).to(device)
 model = Seq2Seq(encoder_net, decoder_net).to(device)
@@ -177,19 +221,28 @@ optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 pad_idx = vocab_eng['<pad>']
 criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
 
-# Charger le modèle s'il existe
-if os.path.isfile('german2english.pth'):
+# Load the model if it exists
+start_from_checkpoint = False
+model_path = '/kaggle/input/my-seq2seq-german2english-translator/pytorch/continue_training_from_checkpoint/1/german2english.pth'
+
+if os.path.isfile(model_path):
     print("Loading model from checkpoint...")
-    checkpoint = torch.load('german2english.pth')
+    checkpoint = torch.load(model_path)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     step = checkpoint['step']
+    print(f'Model loaded from {model_path} with step {step}')
+else:
+    print("No model found")
+    if start_from_checkpoint:
+        print("Exiting...")
+        sys.exit()
+    print("Starting from scratch...")
 
-# Fonction de traduction
+# Translation function
 def translate_sentence(model, sentence, tokenizer_ger, vocab_ger, vocab_eng, device, max_length=50):
     tokens = ['<sos>'] + tokenizer_ger(sentence) + ['<eos>']
     text_to_indices = [vocab_ger[token] for token in tokens]
-    print(f'Tokens convertis en indices: {text_to_indices}')
     sentence_tensor = torch.LongTensor(text_to_indices).unsqueeze(1).to(device)
     with torch.no_grad():
         encoder_states, hidden, cell = model.encoder(sentence_tensor)
@@ -204,10 +257,9 @@ def translate_sentence(model, sentence, tokenizer_ger, vocab_ger, vocab_eng, dev
         if output.argmax(1).item() == vocab_eng['<eos>']:
             break
     translated_sentence = [vocab_eng.lookup_token(idx) for idx in outputs]
-    print(f'Sentence traduite: {translated_sentence}')
     return translated_sentence
 
-# Fonction de calcul de la perte avec masque
+# Loss calculation function with mask
 def masked_cross_entropy(logits, target, pad_idx):
     target = target.contiguous().view(-1)
     mask = target != pad_idx
@@ -216,9 +268,39 @@ def masked_cross_entropy(logits, target, pad_idx):
     loss = loss.masked_select(mask).mean()
     return loss
 
+# Function to calculate the BLUE score for a DataLoader
+def calculate_bleu_score(model, data_loader, tokenizer_ger, vocab_ger, vocab_eng, device):
+    smooth = SmoothingFunction().method4
+    bleu_scores = []
+    model.eval()
+    with torch.no_grad():
+        for src, trg in data_loader:
+            batch_size = src.shape[1]
+            for i in range(batch_size):  # Utilisez batch_size au lieu de len(src)
+                src_sentence = ' '.join([vocab_ger.lookup_token(idx) for idx in src[:, i].tolist() if idx != vocab_ger['<pad>']])
+                trg_sentence = ' '.join([vocab_eng.lookup_token(idx) for idx in trg[:, i].tolist() if idx != vocab_eng['<pad>']])
+                translation = translate_sentence(model, src_sentence, tokenizer_ger, vocab_ger, vocab_eng, device)
+                reference = [trg_sentence.split()]
+                candidate = translation[1:-1]
+                bleu_score = sentence_bleu(reference, candidate, smoothing_function=smooth)
+                bleu_scores.append(bleu_score)
+    return np.mean(bleu_scores)
 
-# Boucle d'entraînement
-for epoch in range(num_epochs):
+
+# Training loop
+early_stopping_patience = 5
+best_loss = float('inf')
+patience_counter = 0
+epoch = 0
+max_epochs = 100
+
+for param_group in optimizer.param_groups:
+    param_group['lr'] = learning_rate
+
+print("Starting training...")
+print(f'Parameters are : initial learning_rate={learning_rate_initial}, final learning_rate={learning_rate_final}')
+print(f'max_epochs={max_epochs}, patience={early_stopping_patience}')
+while learning_rate >= learning_rate_final:
     model.train()
     epoch_loss = 0
     num_batches = 0
@@ -241,20 +323,37 @@ for epoch in range(num_epochs):
         writer.add_scalar("Training loss", loss.item(), global_step=step)
         step += 1
         num_batches += 1
-
-    print(f'Epoch [{epoch + 1}/{num_epochs}] Loss: {epoch_loss / num_batches}')
-
-    # Sauvegarder le modèle toutes les 3 époques
-    if epoch % 3 == 0 and epoch > 0:
+    
+    # Early stopping
+    if loss < best_loss:
+        best_loss = loss
+        patience_counter = 0
         torch.save({
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'step': step
         }, 'german2english.pth')
         print(f'=>Model saved')
+    else:
+        patience_counter += 1
+        if patience_counter >= early_stopping_patience:
+            learning_rate = learning_rate * learning_rate_decay
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = learning_rate
+    
+    if epoch >= max_epochs:
+        break
 
-    model.eval()
     sentence = "zwei jungen stehen neben einem holzhaufen"
-    print(tokenizer_ger(sentence))
     translated_sentence = translate_sentence(model, sentence, tokenizer_ger, vocab_ger, vocab_eng, device, max_length=50)
-    print(f'Epoch [{epoch + 1}/{num_epochs}] Translated Sentence: {" ".join(translated_sentence[1:-1])}')
+    
+    print(f'Epoch {epoch + 1} ; Learning rate: {param_group["lr"]} ; Loss: {epoch_loss / num_batches}')
+    print(f'Translated Sentence: {" ".join(translated_sentence[1:-1])}')
+    epoch += 1
+
+# Final assessment on the test set with the best model
+checkpoint = torch.load('german2english.pth')
+model.load_state_dict(checkpoint['model_state_dict'])
+
+test_bleu = calculate_bleu_score(model, test_loader, tokenizer_ger, vocab_ger, vocab_eng, device)
+print(f'Test BLEU: {test_bleu*100:.2f}')
