@@ -18,6 +18,12 @@ except ImportError:
     import nltk
     from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
+try:
+    import evaluate
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "evaluate"])
+    import evaluate
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -174,7 +180,7 @@ class Seq2Seq(nn.Module):
         return outputs
 
 # Training parameters
-learning_rate_initial = 0.002
+learning_rate_initial = 0.01
 learning_rate_final = 0.0005
 learning_rate_decay = 0.9
 learning_rate = learning_rate_initial
@@ -259,37 +265,10 @@ def translate_sentence(model, sentence, tokenizer_ger, vocab_ger, vocab_eng, dev
     translated_sentence = [vocab_eng.lookup_token(idx) for idx in outputs]
     return translated_sentence
 
-# Loss calculation function with mask
-def masked_cross_entropy(logits, target, pad_idx):
-    target = target.contiguous().view(-1)
-    mask = target != pad_idx
-    logits = logits.contiguous().view(-1, logits.size(-1))
-    loss = nn.CrossEntropyLoss(reduction='none')(logits, target)
-    loss = loss.masked_select(mask).mean()
-    return loss
-
-# Function to calculate the BLUE score for a DataLoader
-def calculate_bleu_score(model, data_loader, tokenizer_ger, vocab_ger, vocab_eng, device):
-    smooth = SmoothingFunction().method4
-    bleu_scores = []
-    model.eval()
-    with torch.no_grad():
-        for src, trg in data_loader:
-            batch_size = src.shape[1]
-            for i in range(batch_size):  # Utilisez batch_size au lieu de len(src)
-                src_sentence = ' '.join([vocab_ger.lookup_token(idx) for idx in src[:, i].tolist() if idx != vocab_ger['<pad>']])
-                trg_sentence = ' '.join([vocab_eng.lookup_token(idx) for idx in trg[:, i].tolist() if idx != vocab_eng['<pad>']])
-                translation = translate_sentence(model, src_sentence, tokenizer_ger, vocab_ger, vocab_eng, device)
-                reference = [trg_sentence.split()]
-                candidate = translation[1:-1]
-                bleu_score = sentence_bleu(reference, candidate, smoothing_function=smooth)
-                bleu_scores.append(bleu_score)
-    return np.mean(bleu_scores)
-
 
 # Training loop
 early_stopping_patience = 5
-best_loss = float('inf')
+best_batch_loss = float('inf')
 patience_counter = 0
 epoch = 0
 max_epochs = 100
@@ -302,7 +281,7 @@ print(f'Parameters are : initial learning_rate={learning_rate_initial}, final le
 print(f'max_epochs={max_epochs}, patience={early_stopping_patience}')
 while learning_rate >= learning_rate_final:
     model.train()
-    epoch_loss = 0
+    train_loss = 0
     num_batches = 0
     for batch_idx, (src, trg) in enumerate(train_loader):
         src = src.to(device)
@@ -314,19 +293,34 @@ while learning_rate >= learning_rate_final:
         output = output[1:].view(-1, output_dim)
         trg = trg[1:].view(-1)
 
-        loss = masked_cross_entropy(output, trg, pad_idx)
+        loss = criterion(output, trg)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
         optimizer.step()
 
-        epoch_loss += loss.item()
+        train_loss += loss.item()
         writer.add_scalar("Training loss", loss.item(), global_step=step)
         step += 1
         num_batches += 1
     
+    train_loss = train_loss / num_batches
+
+    valid_loss = 0
+    num_batches = 0
+    model.eval()
+    for batch_idx, (src, trg) in enumerate(valid_loader):
+        loss = criterion(output, trg)
+        valid_loss += loss.item()
+        writer.add_scalar("Validation loss", loss.item(), global_step=step)
+        num_batches += 1
+    
+    train_loss = train_loss / num_batches
+    validation_loss = valid_loss / num_batches
+
+
     # Early stopping
-    if loss < best_loss:
-        best_loss = loss
+    if validation_loss < best_batch_loss:
+        best_batch_loss = validation_loss
         patience_counter = 0
         torch.save({
             'model_state_dict': model.state_dict(),
@@ -347,7 +341,7 @@ while learning_rate >= learning_rate_final:
     sentence = "zwei jungen stehen neben einem holzhaufen"
     translated_sentence = translate_sentence(model, sentence, tokenizer_ger, vocab_ger, vocab_eng, device, max_length=50)
     
-    print(f'Epoch {epoch + 1} ; Learning rate: {param_group["lr"]} ; Loss: {epoch_loss / num_batches}')
+    print(f'Epoch {epoch + 1} ; Learning rate: {param_group["lr"]} ; Training loss: {train_loss / num_batches} ; Validation loss: {validation_loss / num_batches} ; Patience: {patience_counter}')
     print(f'Translated Sentence: {" ".join(translated_sentence[1:-1])}')
     epoch += 1
 
@@ -355,5 +349,6 @@ while learning_rate >= learning_rate_final:
 checkpoint = torch.load('german2english.pth')
 model.load_state_dict(checkpoint['model_state_dict'])
 
-test_bleu = calculate_bleu_score(model, test_loader, tokenizer_ger, vocab_ger, vocab_eng, device)
-print(f'Test BLEU: {test_bleu*100:.2f}')
+#bleu = evaluate.load("bleu")
+#test_bleu = calculate_bleu_score(model, test_loader, tokenizer_ger, vocab_ger, vocab_eng, device)
+#print(f'Test BLEU: {test_bleu*100:.2f}')
