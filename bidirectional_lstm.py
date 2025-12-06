@@ -90,8 +90,7 @@ def check_accuracy(loader, model):
         print(f'{num_corrects} / {num_samples} with accuracy {float(num_corrects)/float(num_samples)*100:.2f}')
     model.train()    
 
-print(check_accuracy(train_loader, model))
-print(check_accuracy(test_loader, model))      
-
+check_accuracy(train_loader, model)
+check_accuracy(test_loader, model)
 
 
